@@ -48,6 +48,7 @@ IMPORT_TMP = os.path.join(os.path.dirname(__file__), 'tmp-import')
 AUTH_TOKEN = os.environ.get('FALLAXY_TOKEN', None)
 PAGINATION_COUNT = int(os.environ.get('FALLAXY_PAGINATION_COUNT', 5))
 
+DB_LOCK = threading.Lock()
 IMPORT_TABLE = {}
 
 
@@ -156,11 +157,12 @@ class Collection(db.Model):
 
     @staticmethod
     def get_collection(namespace, name):
-        namespace_info = Namespace.query.filter_by(name=namespace).first()
-        if not namespace_info:
-            return
+        with DB_LOCK:
+            namespace_info = Namespace.query.filter_by(name=namespace).first()
+            if not namespace_info:
+                return
 
-        return Collection.query.with_parent(namespace_info).filter_by(name=name).first()
+            return Collection.query.with_parent(namespace_info).filter_by(name=name).first()
 
 
 class CollectionVersion(db.Model):
@@ -248,15 +250,16 @@ class CollectionVersion(db.Model):
 
     @staticmethod
     def get_collection_version(namespace, name, version):
-        namespace_info = Namespace.query.filter_by(name=namespace).first()
-        if not namespace_info:
-            return
+        with DB_LOCK:
+            namespace_info = Namespace.query.filter_by(name=namespace).first()
+            if not namespace_info:
+                return
 
-        info = Collection.query.with_parent(namespace_info).filter_by(name=name).first()
-        if not info:
-            return
+            info = Collection.query.with_parent(namespace_info).filter_by(name=name).first()
+            if not info:
+                return
 
-        return CollectionVersion.query.with_parent(info).filter_by(version=version).first()
+            return CollectionVersion.query.with_parent(info).filter_by(version=version).first()
 
 
 class ImportTask(object):
@@ -341,10 +344,12 @@ def get_tar_hash(tar, name):
 def insert_collection(manifest, filename, collection_size, collection_hash):
     if not Namespace.query.filter_by(name=manifest['namespace']).first():
         db.session.add(Namespace(name=manifest['namespace']))
+        db.session.commit()
     namespace = Namespace.query.filter_by(name=manifest['namespace']).first()
 
     if not Collection.query.with_parent(namespace).filter_by(name=manifest['name']).first():
         db.session.add(Collection(name=manifest['name'], namespace=namespace))
+        db.session.commit()
     collection = Collection.query.with_parent(namespace).filter_by(name=manifest['name']).first()
 
     version_kwargs = {}
@@ -588,12 +593,14 @@ def process_import(import_task, collection_path):
                     raise GalaxyImportError("%s checksum mismatch" % file_name, "GALAXY007")
 
             # We've validated what we can, add the collection to the in memory db.
-            insert_collection(manifest_json['collection_info'], os.path.basename(collection_path),
-                              os.path.getsize(collection_path), collection_hash)
+            with DB_LOCK:
+                insert_collection(manifest_json['collection_info'], os.path.basename(collection_path),
+                                  os.path.getsize(collection_path), collection_hash)
 
         os.rename(collection_path, os.path.join(COLLECTIONS_DIR, os.path.basename(collection_path)))
         import_task.state = 'finished'
     except GalaxyImportError as e:
+        db.session.rollback()
         import_task.state = 'failed'
         import_task.error_code = e.code
         import_task.error_msg = str(e)
@@ -605,6 +612,7 @@ def process_import(import_task, collection_path):
         }
         import_task.messages.append(msg)
     except Exception as e:
+        db.session.rollback()
         import_task.state = 'failed'
         import_task.error_code = 'GALAXYUNKNOWN'
         import_task.error_msg = str(e)
@@ -667,7 +675,8 @@ def get_collection_download(filename):
 @app.route('/api/automation-hub/custom/reset/', methods=['POST'])
 def reset_cache():
     clear = not request.is_json or request.get_json().get('clear', True)
-    start_up(clear=clear)
+    with DB_LOCK:
+        start_up(clear=clear)
     return "", 200
 
 
@@ -680,11 +689,12 @@ def namespaces():
 @app.route('/api/v1/namespaces/<namespace_id>/')
 @login_optional
 def namespaces_id(namespace_id):
-    namespace = Namespace.query.filter_by(id=namespace_id).first()
-    if not namespace:
-        return json_response({'detail': 'Not found.'}, code=404)
+    with DB_LOCK:
+        namespace = Namespace.query.filter_by(id=namespace_id).first()
+        if not namespace:
+            return json_response({'detail': 'Not found.'}, code=404)
 
-    return json_response(namespace.get_api_info())
+        return json_response(namespace.get_api_info())
 
 
 @app.route('/api/<api_version>/collection-imports/<import_id>/')
@@ -702,8 +712,9 @@ def collection_imports(api_version, import_id):
 @app.route('/api/automation-hub/<api_version>/collections/', methods=['GET'])
 @login_optional
 def collections_get(api_version):
-    return json_pagination_response([c.get_api_info(api_version) for c in Collection.query.all()], api_version,
-                                    full_link=False)
+    with DB_LOCK:
+        return json_pagination_response([c.get_api_info(api_version) for c in Collection.query.all()], api_version,
+                                        full_link=False)
 
 
 @app.route('/api/<api_version>/collections/', methods=['POST'])
@@ -767,20 +778,21 @@ def collections_post(api_version):
 
         # Galaxy validates the namespace based on the filename before starting the import process
         existing_collection = CollectionVersion.get_collection_version(manifest['namespace'], manifest['name'],
-                                                                       manifest['version'])
+                                                                           manifest['version'])
         if existing_collection:
             os.remove(import_path)
             return json_galaxy_error(api_version, 'conflict.artifact_exists', 'Artifact already exists.', status=409)
 
-    if api_version == 'v2':
-        import_id = len(IMPORT_TABLE)
-        import_uri = '%sapi/v2/collection-imports/%s/' % (request.host_url, import_id)
-    else:
-        import_id = str(uuid.uuid4())
-        import_uri = '/api/automation-hub/v3/imports/collections/%s/' % import_id
+    with DB_LOCK:
+        if api_version == 'v2':
+            import_id = len(IMPORT_TABLE)
+            import_uri = '%sapi/v2/collection-imports/%s/' % (request.host_url, import_id)
+        else:
+            import_id = str(uuid.uuid4())
+            import_uri = '/api/automation-hub/v3/imports/collections/%s/' % import_id
 
-    import_task = ImportTask(import_id)
-    IMPORT_TABLE[str(import_id)] = import_task
+        import_task = ImportTask(import_id)
+        IMPORT_TABLE[str(import_id)] = import_task
 
     import_thread = threading.Thread(target=process_import, args=(import_task, import_path))
     import_thread.daemon = True
